@@ -1,153 +1,227 @@
-# RobotX ROS2 Control Stack
+# RobotX ROS2 Vision & Policy Stack (WAM-V)
 
-This repository contains the core ROS 2 Python nodes that form the complete control pipeline for your boat.  
-The system connects an RC receiver → selects a working mode → generates servo angles → drives hardware servos → displays LED status → triggers throttle power actuators.
+This repository contains the core ROS 2 Python nodes that implement the **autonomous vision → control pipeline** for a WAM-V boat in RobotX tasks.  
+The system uses **two Reolink RTSP cameras + YOLOv8 on a Jetson Orin Nano** to detect buoys, estimate distance/bearing, plan behavior (gates & wildlife), and output thrust commands that are converted into servo angles for the thrusters.
+
+Target tasks:
+
+- **Entrance & Exit Gates** – detect red/green buoys, form gates, and drive through the center.  
+- **Wildlife Encounter** – detect a black buoy and circle it at a target radius.
+
+Built on:
+
+- **Ubuntu 22.04.5 (Jammy Jellyfish)**
+- **ROS 2 Humble**
+- **NVIDIA Jetson Orin Nano**
 
 ---
 
 ## Node Overview
 
-### **1. `rc_receiver.py`**
-**Role:** Interface between the RC receiver microcontroller and ROS 2.
+### **1. `left_pub.py`** – Left Camera YOLOv8 RTSP Publisher
 
-- Opens a serial connection to `/dev/ttyACM0` at 115200 baud.
-- Expects comma-separated integers (one line per frame).
-- Parses into a list of channel values.
-- Publishes them as `Int32MultiArray` on `rc_channels`.
+**Role:** Run YOLOv8 on the **left Reolink RTSP camera**, estimate distance & bearing to buoys, and publish compact numeric detections.
 
-**ROS Topics:**
-- **Published**
-  - `rc_channels` (`std_msgs/Int32MultiArray`)
+- Opens RTSP stream (GStreamer first, then TCP fallback) from the left camera.
+- Loads YOLOv8 weights (custom buoy detector).
+- For each detection, estimates distance using a pinhole model:
+  - Class-specific focal lengths (`FY_RED`, `FY_GREEN`, `FY_BLACK`)
+  - Known buoy heights (`H_RED`, `H_GREEN`, `H_BLACK`)
+- Computes **bearing** from image x-coordinate and camera HFOV.
+- Publishes **5-tuples** per detection:
+  ```text
+  [cls_idx, conf, bearing_deg, dist_m, spare]
 
----
 
-### **2. `working_mode_publisher.py`**
-**Role:** Determine the boat’s *working mode* from RC channel values.
 
-Logic uses CH1–CH4 to choose among:
+### **2. right_pub.py – Right Camera YOLOv8 RTSP Publisher
 
-- `EMERGENCY STOP`
-- `STANDBY`
-- `REMOTE CONTROL`
-- `AUTONOMOUS`
+Role: Same as left_pub.py but for the right Reolink camera.
 
-**ROS Topics:**
-- **Subscribed**
-  - `rc_channels`
-- **Published**
-  - `working_mode` (`std_msgs/String`)
+Opens RTSP stream from the right camera.
 
----
+Runs YOLOv8 on each frame.
 
-### **3. `remote_control.py`**
-**Role:** Convert RC PWM throttle signals into servo angles.
+Estimates distance & bearing for each buoy.
+
+Publishes the same 5-tuple format for the policy node.
+
+ROS Topics:
+Published
+
+yolov8/Right/detections (std_msgs/String)
+cam_right/minimal (std_msgs/Float32MultiArray)
+yolov8/Right/fps (std_msgs/Float32)
+
+
+
+
+
+### **3. feature_extractor.py -- Minimal Feature Converter
+Role: Parse the string YOLO logs into compact numeric features.
+This node is useful if you are using the older string-only topics instead of the 5-tuple outputs from left_pub / right_pub.
+
+Subscribes to left/right YOLO string topics.
+
+Uses regex to parse class, confidence, distance, and zone (LEFT/MIDDLE/RIGHT).
+
+Converts them into quads:
+[class_idx, confidence, zone_num, distance_m]
+where zone_num ∈ {-1, 0, +1}.
+
+Publishes quads only when detections are present.
+
+ROS Topics:
+
+Subscribed
+yolov8/Left/detections (std_msgs/String)
+yolov8/Right/detections (std_msgs/String)
+
+Published
+cam_left/minimal (std_msgs/Float32MultiArray)
+cam_right/minimal (std_msgs/Float32MultiArray)
+
+Note: The policy node can handle both 5-tuple (bearing-based) and 4-tuple (zone-based) formats, so you can either
+
+
+### **4. policy.py – Gate Navigation & Wildlife Policy
+
+Role: Fuse left/right camera detections and decide how to drive the boat.
+Outputs normalized thrust commands [uL, uR] used later to generate servo angles.
+
+Inputs:
+cam_left/minimal (std_msgs/Float32MultiArray)
+cam_right/minimal (std_msgs/Float32MultiArray)
+
+Accepted formats per detection:
+
+Preferred 5-tuple:
+[cls_idx, conf, bearing_deg, dist_m, spare]
+
+Fallback 4-tuple:
+[cls_idx, conf, zone_num, dist_m] → zone mapped back to approximate bearing.
+
+Output:
+thrust_cmd (std_msgs/Float32MultiArray)
+[uL, uR] in [-1.0, +1.0]
+
+Main behaviors:
+
+Panic Stop
+	If any buoy is detected closer than panic_distance_m, command is [0.0, 0.0].
+
+Entrance/Exit Gate Navigation
+
+		Forms candidate red/green pairs across both cameras.
+
+	Uses distance & bearing to compute:
+
+		Gate width in meters.
+
+		Gate center bearing.
+
+	Accepts only gates with:
+	
+		Width within [min_gate_width_m, max_gate_width_m].
+
+		Similar ranges for red & green (gate_max_range_diff_m).
+
+		Picks the nearest valid gate and:
+
+		Steers toward the gate center.
+		
+		Sets forward speed from distance (slow when close, cruise when far).
+
+Wildlife Encounter – Black Buoy Circle Mode
+
+		If black buoy is present and no valid gate:
+
+	Tries to keep buoy at:
+
+		Target radius (circle_target_radius_m) and
+
+		Target bearing offset (circle_bearing_setpoint_deg).
+	
+		Uses simple proportional control on radius and bearing to circle around the buoy.
+
+Red/Green Avoidance (No Gate)
+
+	If no gate but red/green buoys are visible:
+
+		Finds nearest red/green buoy.
+
+		Steers away from it while moving forward (basic obstacle avoidance).
+
+Hold & Cruise
+
+	When detections disappear:
+
+For no_det_hold_s seconds, hold last maneuver instead of snapping immediately back 								to straight.
+
+After that, revert to straight cruise (forward_base on both sides)
+
+
+### **5. thrust_mixer.py – Thrust → Servo Angle Mapper
+
+Role: Convert the normalized thrust commands from policy.py into servo angles for both thrusters and publish them for the Pi/servo side.
+
+Input:
+thrust_cmd (std_msgs/Float32MultiArray)
+[uL, uR] with each in [-1, +1]
+
+Output:
+auto_angle (std_msgs/Int32MultiArray)
+[left_deg, right_deg] in degrees for hardware servos.
 
 Features:
+	Parameters define neutral and full-throw angles:
+	deg_min, deg_mid, deg_max
+	(e.g. [0°, 80°, 170°])
 
-- Maps PWM → servo angle (0–180°)
-- Applies:
-  - deadband
-  - exponential smoothing
-  - slew rate limiting
-- Publishes left/right steering angles as `remote_angle`
-- Drives a relay GPIO for EMERGENCY STOP
+Computes target angle as:
+angle = deg_mid + span * u
+clamped to [deg_min, deg_max]
 
-**ROS Topics:**
-- **Subscribed**
-  - `rc_channels`
-  - `working_mode`
-- **Published**
-  - `remote_angle` (`std_msgs/Int32MultiArray`)
+Option to disallow reverse (allow_reverse) by clipping negative u.
 
----
+Applies:
+	Exponential moving average smoothing (output_alpha)
 
-### **4. `angle_combiner.py`**
-**Role:** Merge both control sources (remote + autonomous) into one array.
+	Slew rate limiting (slew_deg_per_s) for mechanical safety.
 
-- Subscribes to `remote_angle`
-- Subscribes to `auto_angle`
-- Publishes `[remote_left, remote_right, auto_left, auto_right]` as `servo_angles`
+If thrust_cmd is stale longer than stale_timeout_s, smoothly returns both angles to deg_mid.
 
-**ROS Topics:**
-- **Subscribed**
-  - `remote_angle`
-  - `auto_angle`
-- **Published**
-  - `servo_angles` (`std_msgs/Int32MultiArray`)
+ROS Topics:
 
----
+Subscribed
+thrust_cmd (std_msgs/Float32MultiArray)
 
-### **5. `servo_writer.py`**
-**Role:** Write final servo commands to PCA9685 hardware.
+Published
+auto_angle (std_msgs/Int32MultiArray)
 
-Behavior depends on working mode:
 
-- `REMOTE CONTROL`, `STANDBY`, `EMERGENCY STOP` → use remote angles  
-- `AUTONOMOUS` → use auto angles  
-- Unknown mode → neutral (80°)
 
-Also publishes `servo_angles_echo` for latency measurements.
+High-Level Signal Flow:
 
-**ROS Topics:**
-- **Subscribed**
-  - `working_mode`
-  - `servo_angles`
-- **Published**
-  - `servo_angles_echo` (`std_msgs/Int32MultiArray`)
+[Reolink Left Camera]                      [Reolink Right Camera]
+        ↓                                             ↓
+    left_pub.py                                   right_pub.py
+ (YOLOv8 + distance/bearing)                (YOLOv8 + distance/bearing)
+        ↓                                             ↓
+  cam_left/minimal (Float32MultiArray)   cam_right/minimal (Float32MultiArray)
+        ↘_____________________________________↙
+                     policy.py
+     (gate detection, wildlife circling, avoidance,
+          speed/steering, CSV logging for ML)
+                      ↓
+          thrust_cmd (Float32MultiArray [uL, uR])
+                      ↓
+                 thrust_mixer.py
+      (map normalized thrust to servo angles)
+                      ↓
+          auto_angle (Int32MultiArray [L_deg, R_deg])
+                      ↓
+          [Pi/servo writer] → Thruster servos / ESCs
 
----
 
-### **6. `led_control.py`**
-**Role:** Show system mode using LED relays.
 
-LED patterns:
-
-| Mode             | Green | Yellow | Red |
-|------------------|-------|--------|-----|
-| REMOTE CONTROL   | ON    | ON     | OFF |
-| STANDBY          | OFF   | ON     | OFF |
-| AUTONOMOUS       | ON    | OFF    | OFF |
-| EMERGENCY STOP   | OFF   | OFF    | ON  |
-
-**ROS Topics:**
-- **Subscribed**
-  - `working_mode`
-
----
-
-### **7. `throttle_power.py`**
-**Role:** Trigger physical throttle power buttons using dedicated servos.
-
-- Watches CH5 on the RC input
-- If CH5 < 1450 → press left power button  
-- If CH5 > 1550 → press right power button  
-- Otherwise → keep servos in neutral
-
-**ROS Topics:**
-- **Subscribed**
-  - `rc_channels`
-
----
-
-## High-Level Signal Flow
-
-```text
-[RC Transmitter]
-        ↓
-[Receiver + Microcontroller] --(serial CSV)--> rc_receiver.py
-        ↓
-   rc_channels (Int32MultiArray)
-        ↓                       ↘
-working_mode_publisher.py        throttle_power.py
-        ↓
- working_mode (String)
-    ↓           ↘
-remote_control.py   led_control.py
-        ↓
-  remote_angle (Int32MultiArray)
-        ↘
-    angle_combiner.py ← auto_angle (from autonomous node)
-        ↓
- servo_angles (Int32MultiArray)
-        ↓
-    servo_writer.py → PCA9685 → physical servos (channels 0 & 15)
